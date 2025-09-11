@@ -11,6 +11,9 @@
 (define-constant ERR_INVALID_PRICE (err u105))
 (define-constant ERR_SELF_TRADE (err u106))
 (define-constant ERR_INVALID_STRING (err u107))
+(define-constant ERR_EMPTY_BATCH (err u108))
+(define-constant ERR_BATCH_TOO_LARGE (err u109))
+(define-constant MAX_BATCH_SIZE u50) ;; Maximum batch size for operations
 
 ;; Data Variables
 (define-data-var next-credit-id uint u1)
@@ -76,6 +79,82 @@
   )
 )
 
+;; Batch operation helper functions
+(define-private (validate-batch-size (batch-size uint))
+  (and (> batch-size u0) (<= batch-size MAX_BATCH_SIZE))
+)
+
+(define-private (process-single-credit-issuance 
+  (credit-data {amount: uint, price: uint, project-type: (string-ascii 50), verification-standard: (string-ascii 30)})
+  (acc {success: bool, total-amount: uint, credit-ids: (list 50 uint)}))
+  (if (get success acc)
+    (let (
+      (amount (get amount credit-data))
+      (price (get price credit-data))
+      (project-type (get project-type credit-data))
+      (verification-standard (get verification-standard credit-data))
+      (credit-id (var-get next-credit-id))
+    )
+      (if (and 
+            (is-valid-amount amount)
+            (is-valid-price price)
+            (is-valid-string project-type)
+            (is-valid-verification-standard verification-standard))
+        (begin
+          (map-set carbon-credits credit-id {
+            issuer: tx-sender,
+            owner: tx-sender,
+            amount: amount,
+            price-per-credit: price,
+            project-type: project-type,
+            verification-standard: verification-standard,
+            issue-date: stacks-block-height,
+            retired: false,
+            for-sale: false
+          })
+          (var-set next-credit-id (+ credit-id u1))
+          {
+            success: true,
+            total-amount: (+ (get total-amount acc) amount),
+            credit-ids: (unwrap-panic (as-max-len? (append (get credit-ids acc) credit-id) u50))
+          }
+        )
+        {success: false, total-amount: (get total-amount acc), credit-ids: (get credit-ids acc)}
+      )
+    )
+    acc
+  )
+)
+
+(define-private (process-single-credit-retirement 
+  (credit-id uint)
+  (acc {success: bool, total-retired: uint, retired-ids: (list 50 uint)}))
+  (if (get success acc)
+    (match (map-get? carbon-credits credit-id)
+      credit 
+        (if (and 
+              (is-eq (get owner credit) tx-sender)
+              (not (get retired credit)))
+          (begin
+            (map-set carbon-credits credit-id (merge credit {
+              retired: true,
+              for-sale: false
+            }))
+            (map-delete marketplace-listings credit-id)
+            {
+              success: true,
+              total-retired: (+ (get total-retired acc) (get amount credit)),
+              retired-ids: (unwrap-panic (as-max-len? (append (get retired-ids acc) credit-id) u50))
+            }
+          )
+          {success: false, total-retired: (get total-retired acc), retired-ids: (get retired-ids acc)}
+        )
+      {success: false, total-retired: (get total-retired acc), retired-ids: (get retired-ids acc)}
+    )
+    acc
+  )
+)
+
 ;; Public Functions
 
 ;; Issue new carbon credits
@@ -101,6 +180,25 @@
     (update-user-balance tx-sender amount u0)
     (var-set next-credit-id (+ credit-id u1))
     (ok credit-id)
+  )
+)
+
+;; Batch issue carbon credits
+(define-public (batch-issue-credits 
+  (credits-data (list 50 {amount: uint, price: uint, project-type: (string-ascii 50), verification-standard: (string-ascii 30)})))
+  (let (
+    (batch-size (len credits-data))
+    (result (fold process-single-credit-issuance credits-data {success: true, total-amount: u0, credit-ids: (list)}))
+  )
+    (asserts! (validate-batch-size batch-size) ERR_EMPTY_BATCH)
+    (asserts! (get success result) ERR_INVALID_AMOUNT)
+    
+    (update-user-balance tx-sender (get total-amount result) u0)
+    (ok {
+      total-issued: batch-size,
+      total-amount: (get total-amount result),
+      credit-ids: (get credit-ids result)
+    })
   )
 )
 
@@ -183,6 +281,24 @@
   )
 )
 
+;; Batch retire carbon credits
+(define-public (batch-retire-credits (credit-ids (list 50 uint)))
+  (let (
+    (batch-size (len credit-ids))
+    (result (fold process-single-credit-retirement credit-ids {success: true, total-retired: u0, retired-ids: (list)}))
+  )
+    (asserts! (validate-batch-size batch-size) ERR_EMPTY_BATCH)
+    (asserts! (get success result) ERR_UNAUTHORIZED)
+    
+    (update-user-balance tx-sender (- u0 (get total-retired result)) (get total-retired result))
+    (ok {
+      total-retired: batch-size,
+      total-amount: (get total-retired result),
+      retired-ids: (get retired-ids result)
+    })
+  )
+)
+
 ;; Remove from sale
 (define-public (remove-from-sale (credit-id uint))
   (let ((credit (unwrap! (map-get? carbon-credits credit-id) ERR_CREDIT_NOT_FOUND)))
@@ -220,6 +336,11 @@
 ;; Get next credit ID
 (define-read-only (get-next-credit-id)
   (var-get next-credit-id)
+)
+
+;; Get maximum batch size
+(define-read-only (get-max-batch-size)
+  MAX_BATCH_SIZE
 )
 
 ;; Check if credit is available for purchase
