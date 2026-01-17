@@ -22,6 +22,8 @@
 (define-constant ERR_INVALID_PRINCIPAL (err u116))
 (define-constant ERR_INVALID_FRACTION (err u117))
 (define-constant ERR_CREDIT_CANNOT_BE_SPLIT (err u118))
+(define-constant ERR_SELF_TRANSFER (err u119))
+(define-constant ERR_CREDIT_LISTED_FOR_SALE (err u120))
 (define-constant MAX_BATCH_SIZE u50)
 (define-constant MIN_FRACTION_AMOUNT u1)
 
@@ -29,6 +31,7 @@
 (define-data-var next-credit-id uint u1)
 (define-data-var next-sensor-id uint u1)
 (define-data-var platform-fee uint u250)
+(define-data-var next-transfer-id uint u1)
 
 ;; Data Maps
 (define-map carbon-credits
@@ -105,6 +108,17 @@
     original-credit-id: uint,
     fraction-number: uint,
     total-fractions: uint
+  }
+)
+
+(define-map credit-transfers
+  uint
+  {
+    from: principal,
+    to: principal,
+    credit-id: uint,
+    amount: uint,
+    transfer-date: uint
   }
 )
 
@@ -300,7 +314,6 @@
   )
 )
 
-;; Generate list of indices for fractions
 (define-private (generate-fraction-indices (count uint))
   (if (<= count u10)
     (if (<= count u5)
@@ -329,7 +342,6 @@
       (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20 u21 u22 u23 u24 u25 u26 u27 u28 u29 u30 u31 u32 u33 u34 u35 u36 u37 u38 u39 u40 u41 u42 u43 u44 u45 u46 u47 u48 u49 u50)))
 )
 
-;; Process creation of a single fraction
 (define-private (process-fraction-creation 
   (fraction-index uint)
   (state {
@@ -404,7 +416,6 @@
   )
 )
 
-;; Helper to validate fractions can be merged
 (define-private (validate-fractions-for-merge (fraction-ids (list 50 uint)))
   (let ((first-id (unwrap! (element-at? fraction-ids u0) ERR_INVALID_AMOUNT)))
     (let ((first-fraction (unwrap! (map-get? carbon-credits first-id) ERR_CREDIT_NOT_FOUND)))
@@ -417,7 +428,6 @@
   )
 )
 
-;; Helper to sum fraction amounts using fold
 (define-private (sum-fraction-amounts (fraction-id uint) (state {total: uint, valid: bool}))
   (if (get valid state)
     (match (map-get? carbon-credits fraction-id)
@@ -432,7 +442,6 @@
   )
 )
 
-;; Helper to retire fractions after merge
 (define-private (retire-fractions-helper (fraction-ids (list 50 uint)))
   (fold retire-single-fraction fraction-ids (ok true))
 )
@@ -528,7 +537,6 @@
   )
 )
 
-;; Fractionalize carbon credits into smaller denominations
 (define-public (fractionalize-credit (credit-id uint) (number-of-fractions uint))
   (let (
     (credit (unwrap! (map-get? carbon-credits credit-id) ERR_CREDIT_NOT_FOUND))
@@ -573,7 +581,6 @@
   )
 )
 
-;; Merge fractional credits back into a larger credit
 (define-public (merge-fractional-credits (fraction-ids (list 50 uint)))
   (let (
     (batch-size (len fraction-ids))
@@ -614,6 +621,48 @@
   )
 )
 
+(define-public (transfer-credit (credit-id uint) (recipient principal))
+  (let (
+    (credit (unwrap! (map-get? carbon-credits credit-id) ERR_CREDIT_NOT_FOUND))
+    (transfer-id (var-get next-transfer-id))
+  )
+    (asserts! (is-eq (get owner credit) tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (not (get retired credit)) ERR_CREDIT_ALREADY_RETIRED)
+    (asserts! (not (get for-sale credit)) ERR_CREDIT_LISTED_FOR_SALE)
+    (asserts! (is-valid-principal recipient) ERR_INVALID_PRINCIPAL)
+    (asserts! (not (is-eq tx-sender recipient)) ERR_SELF_TRANSFER)
+    
+    (map-set carbon-credits credit-id (merge credit {
+      owner: recipient
+    }))
+    
+    (map-set credit-transfers transfer-id {
+      from: tx-sender,
+      to: recipient,
+      credit-id: credit-id,
+      amount: (get amount credit),
+      transfer-date: stacks-block-height
+    })
+    
+    (var-set next-transfer-id (+ transfer-id u1))
+    
+    (match (safe-subtract u0 (get amount credit))
+      neg-amount
+        (begin
+          (try! (update-user-balance tx-sender neg-amount u0))
+          (try! (update-user-balance recipient (get amount credit) u0))
+          (ok transfer-id)
+        )
+      err-subtract
+        (begin
+          (try! (update-user-balance tx-sender u0 u0))
+          (try! (update-user-balance recipient (get amount credit) u0))
+          (ok transfer-id)
+        )
+    )
+  )
+)
+
 (define-public (register-iot-sensor 
   (sensor-address (string-ascii 100))
   (project-location (string-ascii 100))
@@ -647,321 +696,26 @@
     ERR_SENSOR_NOT_FOUND
   )
 )
-
 (define-public (submit-sensor-reading 
-  (sensor-id uint) 
-  (co2-reduction uint) 
-  (energy-generated uint) 
-  (trees-planted uint))
-  (let (
-    (validated-sensor-id (try! (validate-and-get-sensor-id sensor-id)))
-    (current-block stacks-block-height)
-  )
-    (asserts! (is-authorized-oracle tx-sender) ERR_INVALID_ORACLE)
+  (sensor-id uint)
+  (co2-reduction uint)
+  (energy-generated uint)
+  (trees-planted uint)
+  (oracle principal))
+  (let ((validated-sensor-id (try! (validate-and-get-sensor-id sensor-id))))
+    (asserts! (is-authorized-oracle oracle) ERR_INVALID_ORACLE)
+    (asserts! (is-valid-amount co2-reduction) ERR_INVALID_SENSOR_DATA)
+    (asserts! (is-valid-amount energy-generated) ERR_INVALID_SENSOR_DATA)
+    (asserts! (is-valid-amount trees-planted) ERR_INVALID_SENSOR_DATA)
     
-    (asserts! (and 
-      (<= co2-reduction u340282366920938463463374607431768211455)
-      (<= energy-generated u340282366920938463463374607431768211455)
-      (<= trees-planted u340282366920938463463374607431768211455)
-      (or (> co2-reduction u0) 
-          (> energy-generated u0) 
-          (> trees-planted u0))) 
-      ERR_INVALID_SENSOR_DATA)
-    
-    (let (
-      (sensor-data (unwrap! (map-get? iot-sensors validated-sensor-id) ERR_SENSOR_NOT_FOUND))
-    )
-      (asserts! (get is-active sensor-data) ERR_SENSOR_NOT_FOUND)
-      
-      (map-set sensor-readings {sensor-id: validated-sensor-id, timestamp: current-block} {
-        co2-reduction: co2-reduction,
-        energy-generated: energy-generated,
-        trees-planted: trees-planted,
-        verified: true,
-        oracle: tx-sender
-      })
-      
-      (map-set iot-sensors validated-sensor-id (merge sensor-data {
-        last-reading: (some current-block)
-      }))
-      
-      (ok true)
-    )
-  )
-)
-
-(define-public (verify-credits-with-sensor (credit-id uint))
-  (let (
-    (credit (unwrap! (map-get? carbon-credits credit-id) ERR_CREDIT_NOT_FOUND))
-    (sensor-id-val (unwrap! (get sensor-id credit) ERR_SENSOR_NOT_FOUND))
-  )
-    (asserts! (is-eq tx-sender (get issuer credit)) ERR_UNAUTHORIZED)
-    (asserts! (validate-sensor-id-with-existence sensor-id-val) ERR_SENSOR_NOT_FOUND)
-    
-    (let (
-      (sensor-data (unwrap! (map-get? iot-sensors sensor-id-val) ERR_SENSOR_NOT_FOUND))
-      (last-reading-block (unwrap! (get last-reading sensor-data) ERR_INVALID_SENSOR_DATA))
-    )
-      (match (map-get? sensor-readings {sensor-id: sensor-id-val, timestamp: last-reading-block})
-        reading
-          (let (
-            (co2-val (get co2-reduction reading))
-            (energy-val (get energy-generated reading))
-            (trees-val (get trees-planted reading))
-          )
-            (match (safe-add co2-val energy-val)
-              temp-sum
-                (match (safe-add temp-sum trees-val)
-                  verification-score
-                    (begin
-                      (asserts! (>= verification-score (get verification-threshold sensor-data)) ERR_VERIFICATION_THRESHOLD_NOT_MET)
-                      
-                      (map-set carbon-credits credit-id (merge credit {
-                        verification-status: "verified",
-                        last-verified: (some stacks-block-height)
-                      }))
-                      (ok true)
-                    )
-                  err-calc (err u115)
-                )
-              err-calc (err u115)
-            )
-          )
-        (err u111)
-      )
-    )
-  )
-)
-
-(define-public (list-for-sale (credit-id uint) (price-per-credit uint))
-  (let ((credit (unwrap! (map-get? carbon-credits credit-id) ERR_CREDIT_NOT_FOUND)))
-    (asserts! (is-eq (get owner credit) tx-sender) ERR_UNAUTHORIZED)
-    (asserts! (not (get retired credit)) ERR_CREDIT_ALREADY_RETIRED)
-    (asserts! (is-valid-price price-per-credit) ERR_INVALID_PRICE)
-    
-    (map-set carbon-credits credit-id (merge credit {
-      for-sale: true,
-      price-per-credit: price-per-credit
-    }))
-    
-    (map-set marketplace-listings credit-id {
-      seller: tx-sender,
-      price-per-credit: price-per-credit,
-      available-amount: (get amount credit),
-      listing-date: stacks-block-height
+    (map-set sensor-readings {sensor-id: validated-sensor-id, timestamp: stacks-block-height} {
+      co2-reduction: co2-reduction,
+      energy-generated: energy-generated,
+      trees-planted: trees-planted,
+      verified: false,
+      oracle: oracle
     })
     
     (ok true)
   )
-)
-
-(define-public (purchase-credits (credit-id uint) (amount uint))
-  (let (
-    (credit (unwrap! (map-get? carbon-credits credit-id) ERR_CREDIT_NOT_FOUND))
-    (listing (unwrap! (map-get? marketplace-listings credit-id) ERR_CREDIT_NOT_FOUND))
-    (price-per-credit (get price-per-credit credit))
-    (platform-fee-rate (var-get platform-fee))
-  )
-    (asserts! (get for-sale credit) ERR_CREDIT_NOT_FOUND)
-    (asserts! (not (get retired credit)) ERR_CREDIT_ALREADY_RETIRED)
-    (asserts! (not (is-eq tx-sender (get owner credit))) ERR_SELF_TRADE)
-    (asserts! (is-valid-amount amount) ERR_INVALID_AMOUNT)
-    (asserts! (<= amount (get available-amount listing)) ERR_INSUFFICIENT_BALANCE)
-    
-    (match (safe-multiply amount price-per-credit)
-      total-cost
-        (match (safe-multiply total-cost platform-fee-rate)
-          fee-before-division
-            (let (
-              (fee (/ fee-before-division u10000))
-              (seller-payment (- total-cost fee))
-            )
-              (try! (stx-transfer? seller-payment tx-sender (get seller listing)))
-              (try! (stx-transfer? fee tx-sender CONTRACT_OWNER))
-              
-              (map-set carbon-credits credit-id (merge credit {
-                owner: tx-sender,
-                amount: amount,
-                for-sale: false
-              }))
-              
-              (try! (update-user-balance tx-sender amount u0))
-              (try! (update-user-balance (get seller listing) u0 u0))
-              
-              (map-delete marketplace-listings credit-id)
-              (ok true)
-            )
-          err-fee-calc (err u115)
-        )
-      err-total-calc (err u115)
-    )
-  )
-)
-
-(define-public (retire-credits (credit-id uint))
-  (let ((credit (unwrap! (map-get? carbon-credits credit-id) ERR_CREDIT_NOT_FOUND)))
-    (asserts! (is-eq (get owner credit) tx-sender) ERR_UNAUTHORIZED)
-    (asserts! (not (get retired credit)) ERR_CREDIT_ALREADY_RETIRED)
-    
-    (map-set carbon-credits credit-id (merge credit {
-      retired: true,
-      for-sale: false
-    }))
-    
-    (match (safe-subtract u0 (get amount credit))
-      neg-amount
-        (try! (update-user-balance tx-sender neg-amount (get amount credit)))
-      err-subtract (try! (update-user-balance tx-sender u0 (get amount credit)))
-    )
-    (map-delete marketplace-listings credit-id)
-    (ok true)
-  )
-)
-
-(define-public (batch-retire-credits (credit-ids (list 50 uint)))
-  (let (
-    (batch-size (len credit-ids))
-    (result (fold process-single-credit-retirement credit-ids {success: true, total-retired: u0, retired-ids: (list)}))
-  )
-    (asserts! (validate-batch-size batch-size) ERR_EMPTY_BATCH)
-    (asserts! (get success result) ERR_UNAUTHORIZED)
-    
-    (match (safe-subtract u0 (get total-retired result))
-      neg-amount
-        (try! (update-user-balance tx-sender neg-amount (get total-retired result)))
-      err-subtract (try! (update-user-balance tx-sender u0 (get total-retired result)))
-    )
-    (ok {
-      total-retired: batch-size,
-      total-amount: (get total-retired result),
-      retired-ids: (get retired-ids result)
-    })
-  )
-)
-
-(define-public (remove-from-sale (credit-id uint))
-  (let ((credit (unwrap! (map-get? carbon-credits credit-id) ERR_CREDIT_NOT_FOUND)))
-    (asserts! (is-eq (get owner credit) tx-sender) ERR_UNAUTHORIZED)
-    (asserts! (get for-sale credit) ERR_CREDIT_NOT_FOUND)
-    
-    (map-set carbon-credits credit-id (merge credit {for-sale: false}))
-    (map-delete marketplace-listings credit-id)
-    (ok true)
-  )
-)
-
-(define-public (authorize-oracle (oracle principal))
-  (begin
-    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
-    (asserts! (is-valid-principal oracle) ERR_INVALID_PRINCIPAL)
-    (asserts! (not (is-eq oracle tx-sender)) ERR_INVALID_PRINCIPAL)
-    (map-set authorized-oracles oracle true)
-    (ok true)
-  )
-)
-
-(define-public (revoke-oracle (oracle principal))
-  (begin
-    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
-    (asserts! (is-valid-principal oracle) ERR_INVALID_PRINCIPAL)
-    (asserts! (default-to false (map-get? authorized-oracles oracle)) ERR_INVALID_ORACLE)
-    (map-delete authorized-oracles oracle)
-    (ok true)
-  )
-)
-
-(define-public (update-platform-fee (new-fee uint))
-  (begin
-    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
-    (asserts! (<= new-fee u1000) ERR_INVALID_AMOUNT)
-    (var-set platform-fee new-fee)
-    (ok true)
-  )
-)
-
-(define-public (deactivate-sensor (sensor-id uint))
-  (begin
-    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
-    (asserts! (validate-sensor-id-with-existence sensor-id) ERR_SENSOR_NOT_FOUND)
-    
-    (let ((sensor-data (unwrap! (map-get? iot-sensors sensor-id) ERR_SENSOR_NOT_FOUND)))
-      (asserts! (get is-active sensor-data) ERR_SENSOR_NOT_FOUND)
-      (map-set iot-sensors sensor-id (merge sensor-data {is-active: false}))
-      (ok true)
-    )
-  )
-)
-
-;; Read-only functions
-
-(define-read-only (get-credit-details (credit-id uint))
-  (map-get? carbon-credits credit-id)
-)
-
-(define-read-only (get-user-balance (user principal))
-  (default-to {total-credits: u0, total-retired: u0} (map-get? user-balances user))
-)
-
-(define-read-only (get-marketplace-listing (credit-id uint))
-  (map-get? marketplace-listings credit-id)
-)
-
-(define-read-only (get-sensor-details (sensor-id uint))
-  (map-get? iot-sensors sensor-id)
-)
-
-(define-read-only (get-sensor-reading (sensor-id uint) (timestamp uint))
-  (map-get? sensor-readings {sensor-id: sensor-id, timestamp: timestamp})
-)
-
-(define-read-only (is-oracle-authorized (oracle principal))
-  (is-authorized-oracle oracle)
-)
-
-(define-read-only (get-platform-fee)
-  (var-get platform-fee)
-)
-
-(define-read-only (get-next-credit-id)
-  (var-get next-credit-id)
-)
-
-(define-read-only (get-next-sensor-id)
-  (var-get next-sensor-id)
-)
-
-(define-read-only (get-max-batch-size)
-  MAX_BATCH_SIZE
-)
-
-(define-read-only (is-credit-available (credit-id uint))
-  (match (map-get? carbon-credits credit-id)
-    credit (and (get for-sale credit) (not (get retired credit)))
-    false
-  )
-)
-
-(define-read-only (is-credit-verified (credit-id uint))
-  (match (map-get? carbon-credits credit-id)
-    credit 
-      (let ((status (get verification-status credit)))
-        (is-eq status "verified")
-      )
-    false
-  )
-)
-
-(define-read-only (get-fraction-details (credit-id uint))
-  (map-get? credit-fractions credit-id)
-)
-
-(define-read-only (is-fractional-credit (credit-id uint))
-  (match (map-get? carbon-credits credit-id)
-    credit (get is-fractional credit)
-    false
-  )
-)
-
-(define-read-only (get-min-fraction-amount)
-  MIN_FRACTION_AMOUNT
 )
